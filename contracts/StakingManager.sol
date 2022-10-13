@@ -8,10 +8,10 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "./SushiToken.sol";
 
 // 'Ownable' so that, if in case you'd want to transfer ownership to DAO later on
-contract StakingManager is Ownable{
+contract StakingManager is SushiToken, Ownable{
     using SafeERC20 for IERC20; // Wrappers around ERC20 operations (inheriting f() from IERC20) that throw on failure
 
-    SushiToken public sushiToken; // Token to be payed as reward
+    // SushiToken public sushiToken; // Token to be payed as reward
 
     uint256 private sushiTokensPerBlock; // Number of reward tokens minted per block
     uint256 private constant STAKER_SHARE_PRECISION = 1e12; // A big number to perform mul and div operations
@@ -42,9 +42,9 @@ contract StakingManager is Ownable{
     event HarvestRewards(address indexed user, uint256 indexed poolId, uint256 amount);
     event PoolCreated(uint256 poolId);
 
-    // Constructor
-    constructor(address _sushiTokenAddress, uint256 _sushiTokensPerBlock) {
-        sushiToken = SushiToken(_sushiTokenAddress);    // Sushi's created instance returned here
+    // Constructor - without any instance of SushiToken as we made it abstract - just able to run .mint()
+    constructor(/*address _sushiTokenAddress, */uint256 _sushiTokensPerBlock) {
+        // sushiToken = SushiToken(_sushiTokenAddress);    // Sushi's created instance returned here
         sushiTokensPerBlock = _sushiTokensPerBlock;
     }
 
@@ -125,7 +125,7 @@ contract StakingManager is Ownable{
         harvestRewards(_poolId);
 
         // Update staker
-        staker.amount = 0;
+        staker.amount = 0;                  // change state first, then send funds, avoid re-entrancy attack
 
         // Update pool
         pool.tokensStaked = pool.tokensStaked - amount;
@@ -143,12 +143,12 @@ contract StakingManager is Ownable{
      */
      // Same size (tokensStaked)
     function harvestRewards(uint256 _poolId) public {
-        updateStakersRewards(_poolId);          // 'lastRewardBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when harvestRewards() happened by any Staker
+        updateStakersRewards(_poolId);              // 'lastRewardBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when harvestRewards() happened by any Staker
         PoolStaker storage staker = poolStakers[_poolId][msg.sender];
-        uint256 rewardsToHarvest = staker.rewards;
-        staker.rewards = 0;
+        uint256 rewardsToHarvest = staker.rewards;  // rewards accrued till now, not yet harvested
+        staker.rewards = 0;                         // change state first, then send / mint the accrued rewards
         emit HarvestRewards(msg.sender, _poolId, rewardsToHarvest);
-        sushiToken.mint(msg.sender, rewardsToHarvest);
+        mint(msg.sender, rewardsToHarvest);         // sent using SushiToken's mint() - called internally
     }
 
     /**
