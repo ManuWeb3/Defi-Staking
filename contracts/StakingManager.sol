@@ -16,12 +16,12 @@ contract StakingManager is SushiToken, Ownable{
     uint256 private sushiTokensPerBlock; // Number of reward tokens minted per block
     uint256 private constant STAKER_SHARE_PRECISION = 1e12; // A big number to perform mul and div operations
     // as floating point numbers are not supported + here, we may end up getting figures in float while calc. stakerShare
-
+    
     // Staking user for a pool = Staker of a Pool = UserInfo
     struct PoolStaker {
         uint256 amount; // The tokens quantity the user has staked.
         uint256 rewards; // The reward tokens quantity the user can harvest (not yet harvested, NOT unstaked)
-        uint256 lastRewardedBlock; // Last block number the user had their rewards CALCULATED (not harvested, not unstaked tokens)
+        uint256 lastRewardedBlock; // Last block number the user had their rewards CALCULATED (not harvested, not unstaked tokens)        
     }
 
     // Staking pool = PoolInfo
@@ -42,14 +42,14 @@ contract StakingManager is SushiToken, Ownable{
     event HarvestRewards(address indexed user, uint256 indexed poolId, uint256 amount);
     event PoolCreated(uint256 poolId);
 
-    // Constructor - without any instance of SushiToken as we made it abstract - just able to run .mint()
+    // Constructor
     constructor(/*address _sushiTokenAddress, */uint256 _sushiTokensPerBlock) {
         // sushiToken = SushiToken(_sushiTokenAddress);    // Sushi's created instance returned here
         sushiTokensPerBlock = _sushiTokensPerBlock;
     }
 
     /**
-     * @dev Create a new staking pool
+     * @dev Create a new staking pool - onlyOwner
      */
     function createPool(IERC20 _stakeToken) external onlyOwner {
         Pool memory pool;               // 'storage' will be used if a mapping / array (above) is used to create a struct's instance
@@ -68,6 +68,7 @@ contract StakingManager is SushiToken, Ownable{
     function addStakerToPoolIfInexistent(uint256 _poolId, address depositingStaker) private {
         Pool storage pool = pools[_poolId];     // pools is Pool[] .. 'memory' will be used if no mapping / array (above) is used to create a struct's instance
         // retrieved Pool's members
+        // pool.stakers.length =0 when first staker deposits its stake.
         for (uint256 i; i < pool.stakers.length; i++) {         // stakers is address[]
             address existingStaker = pool.stakers[i];
             if (existingStaker == depositingStaker) return;     // empty 'return' to break off a loop
@@ -88,13 +89,20 @@ contract StakingManager is SushiToken, Ownable{
         PoolStaker storage staker = poolStakers[_poolId][msg.sender];
 
         // Update pool stakers
-        updateStakersRewards(_poolId);      // lastRewardBlock and rewards of all the Stakers get updated now w.r.t present block when deposit() happened by any Staker
+        // 'updateStakersRewards' has to run before 'addStakerToPoolIfInexistent'...
+        // had it run otherwise, 'blocksSinceLastReward' would have been updated with the block.number when, ideally, it should be zero FOR THE NEW STAKER
+        updateStakersRewards(_poolId);      // 'staker.amount', 'lastRewardedBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when deposit() happened by any Staker
         addStakerToPoolIfInexistent(_poolId, msg.sender);   //maybe he's a new staker
 
         // Update current staker
-        staker.amount = staker.amount + _amount;    // if (new), 'staker.amount' will be zero for the first time else updtaed
-        staker.lastRewardedBlock = block.number;    
+        staker.amount = staker.amount + _amount;    // if (new), 'staker.amount' will be zero by default else updated
+        staker.lastRewardedBlock = block.number;    // current block# will be assigned to 'lastRewardedBlock'
         // needed for 'new' staker, redundant for older ones bcz already got updated above: updateStakersRewards(_poolId);
+        // 'amount' and 'lastRewardedBlock' explicitly updtaed above for the NEW staker...
+        // bcz for new staker, 'updateStakersRewards' won't run for the 1st time... (loop index = 0)
+        // 'rewards' = 0 for the new staker (not updated here)...
+        // 'staker.amount', 'lastRewardedBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when deposit() happened by any Staker
+        // if old staker, all 3 vars will be updated inside 'updateStakersRewards'
 
         // Update pool
         pool.tokensStaked = pool.tokensStaked + _amount;
@@ -102,8 +110,8 @@ contract StakingManager is SushiToken, Ownable{
         // Deposit tokens
         emit Deposit(msg.sender, _poolId, _amount);
         pool.stakeToken.safeTransferFrom(
-            address(msg.sender),
-            address(this),
+            address(msg.sender),        // msg.sender of deposit() = staker
+            address(this),              // this contract = SM.sol
             _amount
         );
     }
@@ -115,17 +123,19 @@ contract StakingManager is SushiToken, Ownable{
     function withdraw(uint256 _poolId) external {
         Pool storage pool = pools[_poolId];
         PoolStaker storage staker = poolStakers[_poolId][msg.sender];
-        uint256 amount = staker.amount;
+        uint256 amount = staker.amount;     // retrieved to later make it '0' before sending...reentrancy
         require(amount > 0, "Withdraw amount can't be zero");
 
         // Update pool stakers
         updateStakersRewards(_poolId);      // 'lastRewardBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when withdraw() happened by any Staker
 
         // Pay rewards
-        harvestRewards(_poolId);
+        harvestRewards(_poolId);            // 'rewards' again updated when this block is mined while withdrawing()
+        // BUT 'rewards' does not get updated when 'updateStakersRewards' runs internally again in 'harvestRewards'...
+        // bcz 'block.number - staker.lastRewardedBlock' = 0 bcz both equal in first iteration of 'updateStakersRewards' above
 
         // Update staker
-        staker.amount = 0;                  // change state first, then send funds, avoid re-entrancy attack
+        staker.amount = 0;                  // first, change state, then send/withdraw
 
         // Update pool
         pool.tokensStaked = pool.tokensStaked - amount;
@@ -143,12 +153,14 @@ contract StakingManager is SushiToken, Ownable{
      */
      // Same size (tokensStaked)
     function harvestRewards(uint256 _poolId) public {
-        updateStakersRewards(_poolId);              // 'lastRewardBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when harvestRewards() happened by any Staker
+        // 'rewards' get updated befre final mint/sending due to below 'updateStakersRewards'...
+        // this meets our condition: 100 new rewards with every block mined incl. harvestRewards itself
+        updateStakersRewards(_poolId);          // 'lastRewardBlock' and 'rewards' of all the Stakers get updated now w.r.t present block when harvestRewards() happened by any Staker
         PoolStaker storage staker = poolStakers[_poolId][msg.sender];
-        uint256 rewardsToHarvest = staker.rewards;  // rewards accrued till now, not yet harvested
-        staker.rewards = 0;                         // change state first, then send / mint the accrued rewards
+        uint256 rewardsToHarvest = staker.rewards;  // already got updated above in 'updateStakersRewards'
+        staker.rewards = 0;                         // first state change, then send/mint
         emit HarvestRewards(msg.sender, _poolId, rewardsToHarvest);
-        mint(msg.sender, rewardsToHarvest);         // sent using SushiToken's mint() - called internally
+        mint(msg.sender, rewardsToHarvest);
     }
 
     /**
@@ -158,7 +170,7 @@ contract StakingManager is SushiToken, Ownable{
      // loop all stakers => CheckedAmountInvestedInThePool of all => UpdateAccRewards of all
     function updateStakersRewards(uint256 _poolId) private {
         Pool storage pool = pools[_poolId];                 // retrieve the specific pool
-        for (uint256 i; i < pool.stakers.length; i++) {
+        for (uint256 i; i < pool.stakers.length; i++) {     // for loop won't run for new staker for the first time, has to be added first
             address stakerAddress = pool.stakers[i];
             PoolStaker storage staker = poolStakers[_poolId][stakerAddress];            // retrieve 1-by-1 all stakers in this pool
             //if (staker.amount == 0) return;               // no reward acc... maybe he participated earlier and now has left, harvesting all rewards + UNstaked
@@ -171,7 +183,8 @@ contract StakingManager is SushiToken, Ownable{
             // rewards has to be updated when, say, some staker harvested its reward
             staker.lastRewardedBlock = block.number;        // re-calc. rewards in the present block and hence updated lastRewardedBlock
             staker.rewards = staker.rewards + rewards;      // rewards getting accumulated till harvested by this user
+            // staker.rewards for the NEW staker = 0 BUT, when he RE-Deposited, rewards = 100 got added to earlier 0 staker.rewards
         }
-
     }
 }
+
